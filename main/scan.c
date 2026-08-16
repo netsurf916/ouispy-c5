@@ -25,6 +25,7 @@ static const char *TAG = "ouispy";
 
 #define WIFI_CHANNEL_DWELL_MS    250
 #define MAX_OBSERVED_MACS        128
+#define MAX_OBSERVED_CLIENTS     128
 #define CATEGORY_HIGH_COUNT      6
 #define IEEE80211_ADDR1_OFFSET   4
 #define IEEE80211_ADDR2_OFFSET   10
@@ -79,6 +80,15 @@ typedef struct
     bool           used;
 } observed_mac_t;
 
+/**
+ * @brief Unique client MAC retained for diagnostic logging.
+ */
+typedef struct
+{
+    uint8_t mac[6];
+    bool    used;
+} observed_client_t;
+
 static const uint8_t wifi_2g_channels[] =
 {
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
@@ -110,6 +120,7 @@ static category_state_t categories[CATEGORY_COUNT] =
 };
 
 static observed_mac_t observed_macs[MAX_OBSERVED_MACS];
+static observed_client_t observed_clients[MAX_OBSERVED_CLIENTS];
 
 /**
  * @brief OUI database used for passive category detection.
@@ -215,6 +226,20 @@ static void wifi_monitor_start( void );
  */
 static void wifi_promiscuous_rx( void *a_buffer,
                                  wifi_promiscuous_pkt_type_t a_type );
+
+/**
+ * @brief Identify client addresses from an observed 802.11 frame.
+ * @param a_frame Raw 802.11 frame payload.
+ * @param a_type ESP-IDF packet type.
+ */
+static void wifi_observe_client_frame( const uint8_t *a_frame,
+                                       wifi_promiscuous_pkt_type_t a_type );
+
+/**
+ * @brief Log a client MAC the first time it is observed.
+ * @param a_mac Six-byte client MAC address.
+ */
+static void wifi_observe_client( const uint8_t *a_mac );
 
 /**
  * @brief Match an observed MAC address against the OUI database.
@@ -346,8 +371,93 @@ static void wifi_promiscuous_rx( void *a_buffer,
 
     const uint8_t *frame = packet->payload;
 
+    wifi_observe_client_frame( frame, a_type );
     oui_observe_mac( &frame[IEEE80211_ADDR1_OFFSET] );
     oui_observe_mac( &frame[IEEE80211_ADDR2_OFFSET] );
+}
+
+/**
+ * @brief Identify likely client addresses from an observed 802.11 frame.
+ * @param a_frame Raw 802.11 frame payload.
+ * @param a_type ESP-IDF packet type.
+ * @details Probe requests identify the transmitter as a client. Infrastructure
+ *          data frames identify the station using the To DS / From DS bits.
+ */
+static void wifi_observe_client_frame( const uint8_t *a_frame,
+                                       wifi_promiscuous_pkt_type_t a_type )
+{
+    const uint16_t frame_control =
+        (uint16_t)a_frame[0] | ( (uint16_t)a_frame[1] << 8 );
+
+    if( a_type == WIFI_PKT_MGMT )
+    {
+        const uint8_t subtype = ( frame_control >> 4 ) & 0x0FU;
+
+        if( subtype == 4 )
+        {
+            wifi_observe_client( &a_frame[IEEE80211_ADDR2_OFFSET] );
+        }
+
+        return;
+    }
+
+    const bool to_ds = ( frame_control & 0x0100U ) != 0;
+    const bool from_ds = ( frame_control & 0x0200U ) != 0;
+
+    if( to_ds && !from_ds )
+    {
+        wifi_observe_client( &a_frame[IEEE80211_ADDR2_OFFSET] );
+    }
+    else if( !to_ds && from_ds )
+    {
+        wifi_observe_client( &a_frame[IEEE80211_ADDR1_OFFSET] );
+    }
+}
+
+/**
+ * @brief Log a client MAC the first time it is observed.
+ * @param a_mac Six-byte client MAC address.
+ */
+static void wifi_observe_client( const uint8_t *a_mac )
+{
+    if( a_mac == NULL || ( a_mac[0] & 0x01U ) != 0 )
+    {
+        return;
+    }
+
+    size_t free_slot = MAX_OBSERVED_CLIENTS;
+
+    for( size_t i = 0; i < MAX_OBSERVED_CLIENTS; i++ )
+    {
+        if( observed_clients[i].used )
+        {
+            if( memcmp( observed_clients[i].mac,
+                        a_mac,
+                        sizeof( observed_clients[i].mac ) ) == 0 )
+            {
+                return;
+            }
+        }
+        else if( free_slot == MAX_OBSERVED_CLIENTS )
+        {
+            free_slot = i;
+        }
+    }
+
+    if( free_slot == MAX_OBSERVED_CLIENTS )
+    {
+        return;
+    }
+
+    memcpy( observed_clients[free_slot].mac,
+            a_mac,
+            sizeof( observed_clients[free_slot].mac ) );
+    observed_clients[free_slot].used = true;
+
+    ESP_LOGI( TAG,
+              "Client observed: %02X:%02X:%02X:%02X:%02X:%02X",
+              a_mac[0], a_mac[1], a_mac[2],
+              a_mac[3], a_mac[4], a_mac[5] );
 }
 
 /**
