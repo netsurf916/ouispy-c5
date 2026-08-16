@@ -1179,13 +1179,13 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
-# Example Configuration
+# OUI-SPY C5 Configuration
 #
-# default:
-CONFIG_EXAMPLE_SCAN_LIST_SIZE=10
-# default:
-# CONFIG_EXAMPLE_USE_SCAN_CHANNEL_BITMAP is not set
-# end of Example Configuration
+
+#
+# Passive WiFi OUI detection currently uses compile-time channel and timing settings in scan.c.
+#
+# end of OUI-SPY C5 Configuration
 
 #
 # Compiler options
