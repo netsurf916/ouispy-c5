@@ -14,7 +14,6 @@
 #include "nvs_flash.h"
 #include "t_dongle_lcd.h"
 
-#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -23,21 +22,23 @@
 
 static const char *TAG = "ouispy";
 
-#define WIFI_CHANNEL_DWELL_MS    250
-#define MAX_OBSERVED_MACS        128
-#define MAX_OBSERVED_CLIENTS     128
-#define CATEGORY_HIGH_COUNT      6
-#define IEEE80211_ADDR1_OFFSET   4
-#define IEEE80211_ADDR2_OFFSET   10
-#define IEEE80211_ADDR2_MIN_LEN  16
-#define STATUS_DIVIDER_Y         9
-#define STATUS_FIRST_ROW_Y       13
-#define STATUS_ROW_HEIGHT        13
-#define STATUS_LABEL_X           3
-#define STATUS_COUNT_X           91
-#define STATUS_BAR_X             108
-#define STATUS_BAR_WIDTH         49
-#define STATUS_BAR_HEIGHT        5
+#define WIFI_2G_CHANNEL_DWELL_MS   80
+#define WIFI_5G_CHANNEL_DWELL_MS   60
+#define WIFI_LCD_REFRESH_MS        750
+#define MAX_OBSERVED_MACS          128
+#define MAX_OBSERVED_CLIENTS       256
+#define CATEGORY_HIGH_COUNT        6
+#define IEEE80211_ADDR1_OFFSET     4
+#define IEEE80211_ADDR2_OFFSET     10
+#define IEEE80211_ADDR2_MIN_LEN    16
+#define STATUS_DIVIDER_Y           9
+#define STATUS_FIRST_ROW_Y         13
+#define STATUS_ROW_HEIGHT          13
+#define STATUS_LABEL_X             3
+#define STATUS_COUNT_X             91
+#define STATUS_BAR_X               108
+#define STATUS_BAR_WIDTH           49
+#define STATUS_BAR_HEIGHT          5
 
 /**
  * @brief Detection categories shown on the LCD.
@@ -89,9 +90,27 @@ typedef struct
     bool    used;
 } observed_client_t;
 
+/**
+ * @brief Channel sweep description for one WiFi band.
+ */
+typedef struct
+{
+    wifi_band_mode_t band;
+    const uint8_t   *channels;
+    size_t           channel_count;
+    uint32_t         dwell_ms;
+    size_t           start_offset;
+} wifi_sweep_t;
+
+/*
+ * ESP32-C5 RF coverage extends through 2484 MHz in 2.4 GHz and 5885 MHz in
+ * 5 GHz. The driver may reject channels that are unavailable under the active
+ * country/regulatory configuration; rejected channels are simply skipped.
+ */
 static const uint8_t wifi_2g_channels[] =
 {
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
+    1, 2, 3, 4, 5, 6, 7,
+    8, 9, 10, 11, 12, 13, 14
 };
 
 static const uint8_t wifi_5g_channels[] =
@@ -101,7 +120,8 @@ static const uint8_t wifi_5g_channels[] =
     100, 104, 108, 112,
     116, 120, 124, 128,
     132, 136, 140, 144,
-    149, 153, 157, 161, 165
+    149, 153, 157, 161,
+    165, 169, 173, 177
 };
 
 #define WIFI_2G_CHANNEL_COUNT \
@@ -121,6 +141,7 @@ static category_state_t categories[CATEGORY_COUNT] =
 
 static observed_mac_t observed_macs[MAX_OBSERVED_MACS];
 static observed_client_t observed_clients[MAX_OBSERVED_CLIENTS];
+static TickType_t lcd_last_refresh;
 
 /**
  * @brief OUI database used for passive category detection.
@@ -210,7 +231,7 @@ static const oui_entry_t oui_database[] =
     ( sizeof( oui_database ) / sizeof( oui_database[0] ) )
 
 /**
- * @brief Initialize ESP-IDF networking and WiFi for passive monitoring.
+ * @brief Initialize ESP-IDF WiFi for receive-only promiscuous monitoring.
  */
 static void wifi_init( void );
 
@@ -231,15 +252,23 @@ static void wifi_promiscuous_rx( void *a_buffer,
  * @brief Identify client addresses from an observed 802.11 frame.
  * @param a_frame Raw 802.11 frame payload.
  * @param a_type ESP-IDF packet type.
+ * @param a_channel Channel on which the frame was received.
+ * @param a_rssi Received signal strength in dBm.
  */
 static void wifi_observe_client_frame( const uint8_t *a_frame,
-                                       wifi_promiscuous_pkt_type_t a_type );
+                                       wifi_promiscuous_pkt_type_t a_type,
+                                       uint8_t a_channel,
+                                       int8_t a_rssi );
 
 /**
  * @brief Log a client MAC the first time it is observed.
  * @param a_mac Six-byte client MAC address.
+ * @param a_channel Channel on which the client was observed.
+ * @param a_rssi Received signal strength in dBm.
  */
-static void wifi_observe_client( const uint8_t *a_mac );
+static void wifi_observe_client( const uint8_t *a_mac,
+                                 uint8_t a_channel,
+                                 int8_t a_rssi );
 
 /**
  * @brief Match an observed MAC address against the OUI database.
@@ -270,14 +299,15 @@ static uint16_t category_color( uint16_t a_count );
 static esp_err_t lcd_draw_status( void );
 
 /**
- * @brief Hop through every channel in one WiFi band.
- * @param a_band ESP-IDF band mode to select.
- * @param a_channels Channel list to monitor.
- * @param a_channel_count Number of entries in a_channels.
+ * @brief Refresh the LCD if its periodic update interval has elapsed.
  */
-static void wifi_monitor_band( wifi_band_mode_t a_band,
-                               const uint8_t *a_channels,
-                               size_t a_channel_count );
+static void lcd_refresh_if_due( void );
+
+/**
+ * @brief Hop through every channel in one WiFi sweep.
+ * @param a_sweep Sweep state and channel plan.
+ */
+static void wifi_monitor_sweep( wifi_sweep_t *a_sweep );
 
 /**
  * @brief Application entry point.
@@ -298,37 +328,51 @@ void app_main( void )
     ESP_ERROR_CHECK( lcd_draw_status() );
     ESP_ERROR_CHECK( lcd_flush() );
 
+    lcd_last_refresh = xTaskGetTickCount();
+
     wifi_init();
     wifi_monitor_start();
 
+    wifi_sweep_t sweep_2g =
+    {
+        .band = WIFI_BAND_MODE_2G_ONLY,
+        .channels = wifi_2g_channels,
+        .channel_count = WIFI_2G_CHANNEL_COUNT,
+        .dwell_ms = WIFI_2G_CHANNEL_DWELL_MS,
+        .start_offset = 0,
+    };
+
+    wifi_sweep_t sweep_5g =
+    {
+        .band = WIFI_BAND_MODE_5G_ONLY,
+        .channels = wifi_5g_channels,
+        .channel_count = WIFI_5G_CHANNEL_COUNT,
+        .dwell_ms = WIFI_5G_CHANNEL_DWELL_MS,
+        .start_offset = 0,
+    };
+
     while( 1 )
     {
-        wifi_monitor_band( WIFI_BAND_MODE_2G_ONLY,
-                           wifi_2g_channels,
-                           WIFI_2G_CHANNEL_COUNT );
-
-        wifi_monitor_band( WIFI_BAND_MODE_5G_ONLY,
-                           wifi_5g_channels,
-                           WIFI_5G_CHANNEL_COUNT );
+        wifi_monitor_sweep( &sweep_2g );
+        wifi_monitor_sweep( &sweep_5g );
     }
 }
 
 /**
- * @brief Initialize ESP-IDF networking and start WiFi in station mode.
+ * @brief Initialize WiFi without a station/AP interface.
+ * @details Promiscuous mode is supported in WIFI_MODE_NULL. Avoiding a station
+ *          interface keeps this application receive-only and eliminates
+ *          association/power-save behavior that is unnecessary for sniffing.
  */
 static void wifi_init( void )
 {
     ESP_ERROR_CHECK( esp_netif_init() );
     ESP_ERROR_CHECK( esp_event_loop_create_default() );
 
-    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
-    assert( sta_netif );
-
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK( esp_wifi_init( &cfg ) );
-    ESP_ERROR_CHECK( esp_wifi_set_mode( WIFI_MODE_STA ) );
+    ESP_ERROR_CHECK( esp_wifi_set_mode( WIFI_MODE_NULL ) );
     ESP_ERROR_CHECK( esp_wifi_start() );
-    ESP_ERROR_CHECK( esp_wifi_set_ps( WIFI_PS_NONE ) );
 }
 
 /**
@@ -345,6 +389,8 @@ static void wifi_monitor_start( void )
     ESP_ERROR_CHECK( esp_wifi_set_promiscuous_filter( &filter ) );
     ESP_ERROR_CHECK( esp_wifi_set_promiscuous_rx_cb( wifi_promiscuous_rx ) );
     ESP_ERROR_CHECK( esp_wifi_set_promiscuous( true ) );
+
+    ESP_LOGI( TAG, "Passive monitor enabled" );
 }
 
 /**
@@ -371,7 +417,11 @@ static void wifi_promiscuous_rx( void *a_buffer,
 
     const uint8_t *frame = packet->payload;
 
-    wifi_observe_client_frame( frame, a_type );
+    wifi_observe_client_frame( frame,
+                               a_type,
+                               packet->rx_ctrl.channel,
+                               packet->rx_ctrl.rssi );
+
     oui_observe_mac( &frame[IEEE80211_ADDR1_OFFSET] );
     oui_observe_mac( &frame[IEEE80211_ADDR2_OFFSET] );
 }
@@ -380,11 +430,15 @@ static void wifi_promiscuous_rx( void *a_buffer,
  * @brief Identify likely client addresses from an observed 802.11 frame.
  * @param a_frame Raw 802.11 frame payload.
  * @param a_type ESP-IDF packet type.
+ * @param a_channel Channel on which the frame was received.
+ * @param a_rssi Received signal strength in dBm.
  * @details Probe requests identify the transmitter as a client. Infrastructure
  *          data frames identify the station using the To DS / From DS bits.
  */
 static void wifi_observe_client_frame( const uint8_t *a_frame,
-                                       wifi_promiscuous_pkt_type_t a_type )
+                                       wifi_promiscuous_pkt_type_t a_type,
+                                       uint8_t a_channel,
+                                       int8_t a_rssi )
 {
     const uint16_t frame_control =
         (uint16_t)a_frame[0] | ( (uint16_t)a_frame[1] << 8 );
@@ -395,7 +449,9 @@ static void wifi_observe_client_frame( const uint8_t *a_frame,
 
         if( subtype == 4 )
         {
-            wifi_observe_client( &a_frame[IEEE80211_ADDR2_OFFSET] );
+            wifi_observe_client( &a_frame[IEEE80211_ADDR2_OFFSET],
+                                 a_channel,
+                                 a_rssi );
         }
 
         return;
@@ -406,19 +462,27 @@ static void wifi_observe_client_frame( const uint8_t *a_frame,
 
     if( to_ds && !from_ds )
     {
-        wifi_observe_client( &a_frame[IEEE80211_ADDR2_OFFSET] );
+        wifi_observe_client( &a_frame[IEEE80211_ADDR2_OFFSET],
+                             a_channel,
+                             a_rssi );
     }
     else if( !to_ds && from_ds )
     {
-        wifi_observe_client( &a_frame[IEEE80211_ADDR1_OFFSET] );
+        wifi_observe_client( &a_frame[IEEE80211_ADDR1_OFFSET],
+                             a_channel,
+                             a_rssi );
     }
 }
 
 /**
  * @brief Log a client MAC the first time it is observed.
  * @param a_mac Six-byte client MAC address.
+ * @param a_channel Channel on which the client was observed.
+ * @param a_rssi Received signal strength in dBm.
  */
-static void wifi_observe_client( const uint8_t *a_mac )
+static void wifi_observe_client( const uint8_t *a_mac,
+                                 uint8_t a_channel,
+                                 int8_t a_rssi )
 {
     if( a_mac == NULL || ( a_mac[0] & 0x01U ) != 0 )
     {
@@ -455,9 +519,10 @@ static void wifi_observe_client( const uint8_t *a_mac )
     observed_clients[free_slot].used = true;
 
     ESP_LOGI( TAG,
-              "Client observed: %02X:%02X:%02X:%02X:%02X:%02X",
+              "Client observed: %02X:%02X:%02X:%02X:%02X:%02X ch=%u rssi=%d",
               a_mac[0], a_mac[1], a_mac[2],
-              a_mac[3], a_mac[4], a_mac[5] );
+              a_mac[3], a_mac[4], a_mac[5],
+              a_channel, a_rssi );
 }
 
 /**
@@ -627,16 +692,35 @@ static esp_err_t lcd_draw_status( void )
 }
 
 /**
- * @brief Hop through the supplied channels and refresh the LCD.
- * @param a_band ESP-IDF band mode to select.
- * @param a_channels Channel list to monitor.
- * @param a_channel_count Number of entries in a_channels.
+ * @brief Refresh the LCD if its periodic update interval has elapsed.
+ * @details Display traffic is intentionally decoupled from channel changes so
+ *          the radio spends nearly all of each sweep interval listening.
  */
-static void wifi_monitor_band( wifi_band_mode_t a_band,
-                               const uint8_t *a_channels,
-                               size_t a_channel_count )
+static void lcd_refresh_if_due( void )
 {
-    esp_err_t err = esp_wifi_set_band_mode( a_band );
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t refresh_ticks = pdMS_TO_TICKS( WIFI_LCD_REFRESH_MS );
+
+    if( ( now - lcd_last_refresh ) < refresh_ticks )
+    {
+        return;
+    }
+
+    ESP_ERROR_CHECK( lcd_draw_status() );
+    ESP_ERROR_CHECK( lcd_flush() );
+    lcd_last_refresh = now;
+}
+
+/**
+ * @brief Hop through every channel in one WiFi sweep.
+ * @param a_sweep Sweep state and channel plan.
+ * @details The starting point rotates after each sweep. This avoids always
+ *          visiting a particular channel at the same point in the cycle and
+ *          reduces systematic misses from periodic/bursty transmitters.
+ */
+static void wifi_monitor_sweep( wifi_sweep_t *a_sweep )
+{
+    esp_err_t err = esp_wifi_set_band_mode( a_sweep->band );
 
     if( err != ESP_OK )
     {
@@ -646,17 +730,27 @@ static void wifi_monitor_band( wifi_band_mode_t a_band,
         return;
     }
 
-    for( size_t i = 0; i < a_channel_count; i++ )
+    for( size_t i = 0; i < a_sweep->channel_count; i++ )
     {
-        err = esp_wifi_set_channel( a_channels[i], WIFI_SECOND_CHAN_NONE );
+        const size_t index =
+            ( a_sweep->start_offset + i ) % a_sweep->channel_count;
+        const uint8_t channel = a_sweep->channels[index];
+
+        err = esp_wifi_set_channel( channel, WIFI_SECOND_CHAN_NONE );
 
         if( err != ESP_OK )
         {
+            ESP_LOGD( TAG,
+                      "Skipping channel %u: %s",
+                      channel,
+                      esp_err_to_name( err ) );
             continue;
         }
 
-        vTaskDelay( pdMS_TO_TICKS( WIFI_CHANNEL_DWELL_MS ) );
-        ESP_ERROR_CHECK( lcd_draw_status() );
-        ESP_ERROR_CHECK( lcd_flush() );
+        vTaskDelay( pdMS_TO_TICKS( a_sweep->dwell_ms ) );
+        lcd_refresh_if_due();
     }
+
+    a_sweep->start_offset =
+        ( a_sweep->start_offset + 1 ) % a_sweep->channel_count;
 }
