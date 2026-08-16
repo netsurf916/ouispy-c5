@@ -1,31 +1,50 @@
-# donglescan
+# ouispy-c5
 
-`donglescan` is an ESP-IDF application for the LILYGO T-Dongle C5. It scans nearby Wi-Fi access points across the supported 2.4 GHz and 5 GHz bands and displays per-channel counts as bar graphs on the built-in LCD.
+`ouispy-c5` is a passive Wi-Fi surveillance-device detector for the LILYGO T-Dongle C5 and ESP32-C5. It listens to 802.11 management and data frames in promiscuous mode, compares observed MAC prefixes against a small OUI database, and highlights matching device categories on the built-in LCD.
+
+The project is inspired by the defensive detection work in [OUI-SPY](https://github.com/colonelpanichacks/oui-spy) and its [OUI detector database](https://github.com/colonelpanichacks/ouispy-detector).
+
+## Current categories
+
+The LCD displays these categories continuously:
+
+- **FLOCK / ALPR** — Flock Safety infrastructure prefixes, including the Wi-Fi promiscuous-mode prefixes documented by the OUI-SPY project
+- **BODY CAM** — Axon body-camera / law-enforcement OUI
+- **DRONE** — DJI, Parrot, and Skydio OUIs
+- **DOORBELL / CAM** — Ring doorbell and security-camera OUIs
+- **SMARTGLASSES** — Meta / Ray-Ban smartglasses OUIs
+
+A category is normally displayed in white. When a matching MAC is observed, that category changes to red for a short alert period. Repeated observations keep the alert active.
+
+## Passive monitoring
+
+The firmware does not associate with nearby networks. ESP-IDF promiscuous mode receives management and data frames while the application hops through configured 2.4 GHz and 5 GHz channels.
+
+Both the receiver (`addr1`) and transmitter (`addr2`) addresses are checked. This follows the Flock promiscuous-mode research documented by OUI-SPY, where examining both addresses can improve detection of devices with burst/sleep behavior.
+
+The detector ignores multicast/broadcast addresses before performing OUI matching.
+
+## Limitations
+
+OUI matching is an indicator, not proof of a particular device or activity. Vendors may share hardware manufacturers, MAC addresses can be randomized, devices may remain silent while a channel is being monitored, and regulatory settings can make some channels unavailable.
+
+The current implementation is Wi-Fi only. Some OUI-SPY detections, particularly Flock/Raven and other devices, also use BLE fingerprints; BLE monitoring can be added separately.
 
 ## Hardware
 
 - LILYGO T-Dongle C5
 - ESP32-C5
 - 160x80 ST7735 LCD
-- On-board RGB LED
-- USB Serial/JTAG interface for flashing and monitoring
-
-## Development environment
-
-The project is built with Espressif ESP-IDF. A typical development setup uses VS Code with the Espressif IDF extension, although the command-line tools are sufficient.
-
-Make sure the ESP-IDF environment has been activated before using `idf.py`.
+- USB Serial/JTAG interface
 
 ## Build
 
-From the repository root:
+Activate the ESP-IDF environment, then from the repository root:
 
 ```sh
 idf.py set-target esp32c5
 idf.py build
 ```
-
-If the target has already been configured, only `idf.py build` is required.
 
 ## Flash and monitor
 
@@ -37,62 +56,21 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 Exit the ESP-IDF monitor with `Ctrl-]`.
 
-## Wi-Fi scanning
+## LCD rendering
 
-The scanner performs passive scans on individual channels and records the number of observed access points. Separate result arrays are maintained for 2.4 GHz and 5 GHz channels.
-
-The application scans an entire band before updating the display, then alternates to the other band. The completed graph remains visible while the opposite band is being scanned.
-
-The current observation interval is controlled by `WIFI_OBSERVATION_MS` in `main/scan.c`.
-
-### 2.4 GHz channels
-
-The application scans channels 1 through 13.
-
-### 5 GHz channels
-
-The application uses an explicit channel list because 5 GHz Wi-Fi channel numbers are not contiguous:
-
-```text
-36 40 44 48
-52 56 60 64
-100 104 108 112 116 120 124 128 132 136 140 144
-149 153 157 161 165
-```
-
-Availability of particular channels may still depend on regulatory configuration and the ESP-IDF Wi-Fi driver.
-
-## LCD drawing
-
-LCD rendering is framebuffer based. Drawing functions update an in-memory RGB565 framebuffer rather than writing directly to the panel.
-
-Call:
-
-```c
-lcd_flush();
-```
-
-to transfer the completed frame to the display. This allows complex screens such as the Wi-Fi bar graph to be rendered off-screen and displayed as a single update, reducing visible flicker.
-
-The LCD implementation provides primitives for:
-
-- framebuffer fill
-- pixels
-- lines
-- filled rectangles
-- 5x7 text rendering with cursor support
+The inherited T-Dongle LCD driver uses an RGB565 framebuffer. The detector renders the complete category status screen in memory and calls `lcd_flush()` to transfer it to the display.
 
 ## Source layout
 
 ```text
 main/
-    scan.c                Wi-Fi scanning and graph rendering
-    t_dongle_lcd.c        LCD and framebuffer implementation
+    scan.c                Passive Wi-Fi monitoring and OUI matching
+    t_dongle_lcd.c        LCD/framebuffer implementation
     t_dongle_lcd.h        LCD public interface
-    t_dongle_rgb_led.c    On-board RGB LED support
-    t_dongle_rgb_led.h    RGB LED public interface
 ```
 
-## Notes
+## OUI source
 
-The project is currently focused on channel occupancy visualization rather than connecting to a wireless network. Counts represent access points observed during each passive scan interval, not associated Wi-Fi client stations.
+The initial OUI table is derived from `colonelpanichacks/ouispy-detector/ouis.md`. It includes Flock Safety, Axon, DJI, Parrot, Skydio, Ring, and Meta/Ray-Ban entries documented there.
+
+This firmware is passive and detection-only. It does not transmit probe frames, associate with observed devices, or attempt to access their traffic contents.
