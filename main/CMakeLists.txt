@@ -1,8 +1,10 @@
 idf_component_register(
     SRCS
         "scan.c"
+        "ble_monitor.c"
         "t_dongle_lcd.c"
     PRIV_REQUIRES
+        bt
         esp_wifi
         nvs_flash
     REQUIRES
