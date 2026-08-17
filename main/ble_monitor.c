@@ -11,6 +11,7 @@
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "host/ble_hs_id.h"
+#include "host/util/util.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 
