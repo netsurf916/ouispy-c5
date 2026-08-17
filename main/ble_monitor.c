@@ -9,6 +9,7 @@
 #include "ble_monitor.h"
 
 #include "esp_log.h"
+#include "esp_private/startup_internal.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "host/ble_hs_id.h"
@@ -201,4 +202,13 @@ static void ble_host_task( void *a_arg )
     (void)a_arg;
     nimble_port_run();
     nimble_port_freertos_deinit();
+}
+
+/*
+ * Start BLE after ESP-IDF component initialization. Keeping this separate from
+ * app_main lets the WiFi channel hopper remain focused on receive scheduling.
+ */
+ESP_SYSTEM_INIT_FN( ouispy_ble_init, SECONDARY, BIT( 0 ), 700 )
+{
+    return ble_monitor_init();
 }
