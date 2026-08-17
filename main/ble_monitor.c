@@ -8,14 +8,12 @@
 #include "ble_monitor.h"
 
 #include "esp_log.h"
-#include "esp_private/startup_internal.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "host/ble_hs_id.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -28,12 +26,45 @@ static const char *TAG = "ouispy_ble";
 static uint8_t own_address_type;
 static ble_observation_cb_t observation_callback;
 
+/**
+ * @brief Process NimBLE GAP events.
+ * @param a_event GAP event supplied by NimBLE.
+ * @param a_arg User argument supplied to the GAP procedure.
+ * @return Zero to continue processing.
+ */
 static int ble_gap_event( struct ble_gap_event *a_event, void *a_arg );
+
+/**
+ * @brief Complete identity setup after the NimBLE host synchronizes.
+ */
 static void ble_on_sync( void );
+
+/**
+ * @brief Run the NimBLE host task.
+ * @param a_arg Unused task argument.
+ */
 static void ble_host_task( void *a_arg );
+
+/**
+ * @brief Start continuous passive BLE scanning.
+ */
 static void ble_start_scan( void );
+
+/**
+ * @brief Parse an advertisement into detector-friendly fields.
+ * @param a_disc NimBLE discovery descriptor.
+ * @param a_observation Destination observation structure.
+ */
 static void ble_parse_advertisement( const struct ble_gap_disc_desc *a_disc,
                                      ble_observation_t *a_observation );
+
+/**
+ * @brief Parse one BLE AD structure.
+ * @param a_type BLE AD type.
+ * @param a_data AD payload bytes.
+ * @param a_length Number of payload bytes.
+ * @param a_observation Destination observation structure.
+ */
 static void ble_parse_field( uint8_t a_type,
                              const uint8_t *a_data,
                              size_t a_length,
@@ -41,10 +72,13 @@ static void ble_parse_field( uint8_t a_type,
 
 /**
  * @brief Initialize NimBLE and start its host task.
+ * @param a_callback Optional callback for parsed BLE advertisements.
+ * @return ESP_OK on success; ESP_FAIL if NimBLE initialization fails.
  */
 esp_err_t ble_monitor_init( ble_observation_cb_t a_callback )
 {
     observation_callback = a_callback;
+
     int rc = nimble_port_init();
 
     if( rc != 0 )
@@ -55,23 +89,30 @@ esp_err_t ble_monitor_init( ble_observation_cb_t a_callback )
 
     ble_hs_cfg.sync_cb = ble_on_sync;
     nimble_port_freertos_init( ble_host_task );
+
     return ESP_OK;
 }
 
+/**
+ * @brief Start continuous passive BLE scanning.
+ */
 static void ble_start_scan( void )
 {
     struct ble_gap_disc_params params =
     {
-        .itvl = BLE_SCAN_ITVL,
-        .window = BLE_SCAN_WINDOW,
-        .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
-        .limited = 0,
-        .passive = 1,
+        .itvl              = BLE_SCAN_ITVL,
+        .window            = BLE_SCAN_WINDOW,
+        .filter_policy     = BLE_HCI_SCAN_FILT_NO_WL,
+        .limited           = 0,
+        .passive           = 1,
         .filter_duplicates = 0,
     };
 
-    int rc = ble_gap_disc( own_address_type, BLE_HS_FOREVER,
-                           &params, ble_gap_event, NULL );
+    int rc = ble_gap_disc( own_address_type,
+                           BLE_HS_FOREVER,
+                           &params,
+                           ble_gap_event,
+                           NULL );
 
     if( rc != 0 )
     {
@@ -83,6 +124,9 @@ static void ble_start_scan( void )
     }
 }
 
+/**
+ * @brief Complete identity setup after the NimBLE host synchronizes.
+ */
 static void ble_on_sync( void )
 {
     int rc = ble_hs_util_ensure_addr( 0 );
@@ -102,7 +146,10 @@ static void ble_on_sync( void )
 }
 
 /**
- * @brief Parse and forward one BLE discovery report.
+ * @brief Process NimBLE GAP events.
+ * @param a_event GAP event supplied by NimBLE.
+ * @param a_arg User argument supplied to the GAP procedure.
+ * @return Zero to continue processing.
  */
 static int ble_gap_event( struct ble_gap_event *a_event, void *a_arg )
 {
@@ -111,6 +158,7 @@ static int ble_gap_event( struct ble_gap_event *a_event, void *a_arg )
     if( a_event->type == BLE_GAP_EVENT_DISC )
     {
         ble_observation_t observation;
+
         ble_parse_advertisement( &a_event->disc, &observation );
 
         if( observation_callback != NULL )
@@ -127,16 +175,23 @@ static int ble_gap_event( struct ble_gap_event *a_event, void *a_arg )
 }
 
 /**
- * @brief Parse BLE AD structures used for device fingerprinting.
- * @details Captures local names, manufacturer company/data, and advertised
- *          16-bit and 128-bit service UUIDs. These remain useful when the
- *          advertiser uses a randomized/private BLE address.
+ * @brief Parse an advertisement into detector-friendly fields.
+ * @param a_disc NimBLE discovery descriptor.
+ * @param a_observation Destination observation structure.
+ * @details The NimBLE address is stored least-significant byte first. The
+ *          detector-facing address is reversed into normal MAC display order.
  */
 static void ble_parse_advertisement( const struct ble_gap_disc_desc *a_disc,
                                      ble_observation_t *a_observation )
 {
     memset( a_observation, 0, sizeof( *a_observation ) );
-    memcpy( a_observation->address, a_disc->addr.val, 6 );
+
+    for( size_t i = 0; i < sizeof( a_observation->address ); i++ )
+    {
+        a_observation->address[i] =
+            a_disc->addr.val[sizeof( a_observation->address ) - 1U - i];
+    }
+
     a_observation->address_type = a_disc->addr.type;
     a_observation->rssi = a_disc->rssi;
 
@@ -157,14 +212,23 @@ static void ble_parse_advertisement( const struct ble_gap_disc_desc *a_disc,
         }
 
         const uint8_t type = a_disc->data[offset + 1U];
+
         ble_parse_field( type,
                          &a_disc->data[offset + 2U],
                          field_length - 1U,
                          a_observation );
+
         offset += (size_t)field_length + 1U;
     }
 }
 
+/**
+ * @brief Parse one BLE AD structure.
+ * @param a_type BLE AD type.
+ * @param a_data AD payload bytes.
+ * @param a_length Number of payload bytes.
+ * @param a_observation Destination observation structure.
+ */
 static void ble_parse_field( uint8_t a_type,
                              const uint8_t *a_data,
                              size_t a_length,
@@ -173,10 +237,12 @@ static void ble_parse_field( uint8_t a_type,
     if( ( a_type == 0x08U || a_type == 0x09U ) && a_length > 0 )
     {
         size_t length = a_length;
+
         if( length >= sizeof( a_observation->name ) )
         {
             length = sizeof( a_observation->name ) - 1U;
         }
+
         memcpy( a_observation->name, a_data, length );
         a_observation->name[length] = '\0';
         a_observation->has_name = true;
@@ -185,11 +251,14 @@ static void ble_parse_field( uint8_t a_type,
     {
         a_observation->company_id =
             (uint16_t)a_data[0] | ( (uint16_t)a_data[1] << 8 );
+
         size_t length = a_length - 2U;
+
         if( length > sizeof( a_observation->manufacturer_data ) )
         {
             length = sizeof( a_observation->manufacturer_data );
         }
+
         memcpy( a_observation->manufacturer_data, &a_data[2], length );
         a_observation->manufacturer_data_len = (uint8_t)length;
         a_observation->has_manufacturer_data = true;
@@ -201,8 +270,11 @@ static void ble_parse_field( uint8_t a_type,
              a_observation->service_uuid16_count < BLE_OBSERVATION_UUID16_MAX;
              offset += 2U )
         {
-            a_observation->service_uuids16[a_observation->service_uuid16_count++] =
-                (uint16_t)a_data[offset] | ( (uint16_t)a_data[offset + 1U] << 8 );
+            const uint8_t index = a_observation->service_uuid16_count++;
+
+            a_observation->service_uuids16[index] =
+                (uint16_t)a_data[offset] |
+                ( (uint16_t)a_data[offset + 1U] << 8 );
         }
     }
     else if( a_type == 0x06U || a_type == 0x07U )
@@ -212,21 +284,23 @@ static void ble_parse_field( uint8_t a_type,
              a_observation->service_uuid128_count < BLE_OBSERVATION_UUID128_MAX;
              offset += 16U )
         {
-            memcpy( a_observation->service_uuids128[
-                        a_observation->service_uuid128_count++],
-                    &a_data[offset], 16 );
+            const uint8_t index = a_observation->service_uuid128_count++;
+
+            memcpy( a_observation->service_uuids128[index],
+                    &a_data[offset],
+                    sizeof( a_observation->service_uuids128[index] ) );
         }
     }
 }
 
+/**
+ * @brief Run the NimBLE host task.
+ * @param a_arg Unused task argument.
+ */
 static void ble_host_task( void *a_arg )
 {
     (void)a_arg;
+
     nimble_port_run();
     nimble_port_freertos_deinit();
-}
-
-ESP_SYSTEM_INIT_FN( ouispy_ble_init, SECONDARY, BIT( 0 ), 700 )
-{
-    return ble_monitor_init( NULL );
 }
