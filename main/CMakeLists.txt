@@ -5,6 +5,7 @@ idf_component_register(
         "t_dongle_lcd.c"
     PRIV_REQUIRES
         bt
+        esp_system
         esp_wifi
         nvs_flash
     REQUIRES
