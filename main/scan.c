@@ -1,19 +1,20 @@
 /**
-    scan.c : T-Dongle C5 passive OUI detector
-    Description: Passively monitors WiFi traffic, matches observed MAC OUIs
-                 against surveillance-device categories, and updates the LCD.
+    scan.c : T-Dongle C5 passive surveillance-device detector
+    Description: Matches WiFi and BLE observations against device signatures
+                 and maintains the LCD status display.
     Copyright 2026 Daniel Wilson
     SPDX-License-Identifier: MIT
 */
 
-#include "esp_event.h"
+#include "ble_monitor.h"
 #include "esp_log.h"
-#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "t_dongle_lcd.h"
+#include "wifi_monitor.h"
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -22,27 +23,20 @@
 
 static const char *TAG = "ouispy";
 
-#define WIFI_2G_CHANNEL_DWELL_MS   80
-#define WIFI_5G_CHANNEL_DWELL_MS   60
-#define WIFI_LCD_REFRESH_MS        750
-#define MAX_OBSERVED_MACS          128
-#define MAX_OBSERVED_CLIENTS       256
-#define CATEGORY_HIGH_COUNT        6
-#define IEEE80211_ADDR1_OFFSET     4
-#define IEEE80211_ADDR2_OFFSET     10
-#define IEEE80211_ADDR2_MIN_LEN    16
-#define STATUS_DIVIDER_Y           9
-#define STATUS_FIRST_ROW_Y         13
-#define STATUS_ROW_HEIGHT          13
-#define STATUS_LABEL_X             3
-#define STATUS_COUNT_X             91
-#define STATUS_BAR_X               108
-#define STATUS_BAR_WIDTH           49
-#define STATUS_BAR_HEIGHT          5
+#define LCD_REFRESH_MS          750
+#define MAX_OBSERVED_DEVICES    256
+#define MAX_WIFI_ENDPOINTS      256
+#define MAX_BLE_ENDPOINTS       256
+#define CATEGORY_HIGH_COUNT     6
+#define STATUS_DIVIDER_Y        9
+#define STATUS_FIRST_ROW_Y      13
+#define STATUS_ROW_HEIGHT       13
+#define STATUS_LABEL_X          3
+#define STATUS_COUNT_X          91
+#define STATUS_BAR_X            108
+#define STATUS_BAR_WIDTH        49
+#define STATUS_BAR_HEIGHT       5
 
-/**
- * @brief Detection categories shown on the LCD.
- */
 typedef enum
 {
     CATEGORY_FLOCK = 0,
@@ -51,84 +45,62 @@ typedef enum
     CATEGORY_DOORBELL_CAMERA,
     CATEGORY_SMARTGLASSES,
     CATEGORY_COUNT
-} oui_category_t;
+} detector_category_t;
 
-/**
- * @brief One OUI-to-category mapping.
- */
+typedef enum
+{
+    DETECTOR_SOURCE_WIFI = 0,
+    DETECTOR_SOURCE_BLE
+} detector_source_t;
+
 typedef struct
 {
-    uint8_t        prefix[3];
-    oui_category_t category;
+    uint8_t             prefix[3];
+    detector_category_t category;
 } oui_entry_t;
 
-/**
- * @brief Runtime state for one detector category.
- */
 typedef struct
 {
     const char        *name;
     volatile uint16_t  count;
 } category_state_t;
 
-/**
- * @brief Unique matched MAC retained to prevent packet-count inflation.
- */
 typedef struct
 {
-    uint8_t        mac[6];
-    oui_category_t category;
-    bool           used;
-} observed_mac_t;
+    detector_source_t   source;
+    uint8_t             address[6];
+    uint8_t             address_type;
+    detector_category_t category;
+    bool                used;
+} observed_device_t;
 
-/**
- * @brief Unique client MAC retained for diagnostic logging.
- */
 typedef struct
 {
-    uint8_t mac[6];
+    uint8_t                 mac[6];
+    wifi_observation_type_t type;
+    bool                    used;
+} wifi_endpoint_t;
+
+typedef struct
+{
+    uint8_t address[6];
+    uint8_t address_type;
     bool    used;
-} observed_client_t;
+} ble_endpoint_t;
 
-/**
- * @brief Channel sweep description for one WiFi band.
- */
 typedef struct
 {
-    wifi_band_mode_t band;
-    const uint8_t   *channels;
-    size_t           channel_count;
-    uint32_t         dwell_ms;
-    size_t           start_offset;
-} wifi_sweep_t;
+    const char         *name_fragment;
+    detector_category_t category;
+} ble_name_signature_t;
 
-/*
- * ESP32-C5 RF coverage extends through 2484 MHz in 2.4 GHz and 5885 MHz in
- * 5 GHz. The driver may reject channels that are unavailable under the active
- * country/regulatory configuration; rejected channels are simply skipped.
- */
-static const uint8_t wifi_2g_channels[] =
+typedef struct
 {
-    1, 2, 3, 4, 5, 6, 7,
-    8, 9, 10, 11, 12, 13, 14
-};
-
-static const uint8_t wifi_5g_channels[] =
-{
-    36, 40, 44, 48,
-    52, 56, 60, 64,
-    100, 104, 108, 112,
-    116, 120, 124, 128,
-    132, 136, 140, 144,
-    149, 153, 157, 161,
-    165, 169, 173, 177
-};
-
-#define WIFI_2G_CHANNEL_COUNT \
-    ( sizeof( wifi_2g_channels ) / sizeof( wifi_2g_channels[0] ) )
-
-#define WIFI_5G_CHANNEL_COUNT \
-    ( sizeof( wifi_5g_channels ) / sizeof( wifi_5g_channels[0] ) )
+    uint16_t            company_id;
+    const uint8_t      *prefix;
+    size_t              prefix_length;
+    detector_category_t category;
+} ble_manufacturer_signature_t;
 
 static category_state_t categories[CATEGORY_COUNT] =
 {
@@ -139,16 +111,11 @@ static category_state_t categories[CATEGORY_COUNT] =
     [CATEGORY_SMARTGLASSES]    = { "SMARTGLASSES", 0 },
 };
 
-static observed_mac_t observed_macs[MAX_OBSERVED_MACS];
-static observed_client_t observed_clients[MAX_OBSERVED_CLIENTS];
+static observed_device_t observed_devices[MAX_OBSERVED_DEVICES];
+static wifi_endpoint_t wifi_endpoints[MAX_WIFI_ENDPOINTS];
+static ble_endpoint_t ble_endpoints[MAX_BLE_ENDPOINTS];
 static TickType_t lcd_last_refresh;
 
-/**
- * @brief OUI database used for passive category detection.
- * @details The baseline entries come from the OUI-SPY detector project. Extra
- *          entries are restricted to vendors with a narrow product scope so
- *          that an OUI match remains useful as a category signal.
- */
 static const oui_entry_t oui_database[] =
 {
     /* Flock Safety / ALPR */
@@ -184,7 +151,7 @@ static const oui_entry_t oui_database[] =
     { { 0x48, 0x27, 0xEA }, CATEGORY_FLOCK },
     { { 0xA4, 0xCF, 0x12 }, CATEGORY_FLOCK },
 
-    /* Axon body cameras / law enforcement */
+    /* Axon body cameras */
     { { 0x00, 0x25, 0xDF }, CATEGORY_BODY_CAM },
 
     /* DJI / Parrot / Skydio */
@@ -230,84 +197,46 @@ static const oui_entry_t oui_database[] =
 #define OUI_DATABASE_COUNT \
     ( sizeof( oui_database ) / sizeof( oui_database[0] ) )
 
-/**
- * @brief Initialize ESP-IDF WiFi for receive-only promiscuous monitoring.
+/*
+ * BLE signatures intentionally use narrow product/vendor identifiers. Generic
+ * company identifiers alone are not used for broad vendors because that would
+ * turn unrelated phones, computers, and accessories into detector matches.
  */
-static void wifi_init( void );
+static const ble_name_signature_t ble_name_signatures[] =
+{
+    { "AXON",        CATEGORY_BODY_CAM },
+    { "BODY",        CATEGORY_BODY_CAM },
+    { "DJI",         CATEGORY_DRONE },
+    { "PARROT",      CATEGORY_DRONE },
+    { "SKYDIO",      CATEGORY_DRONE },
+    { "RING",        CATEGORY_DOORBELL_CAMERA },
+    { "RAY-BAN",     CATEGORY_SMARTGLASSES },
+    { "RAYBAN",      CATEGORY_SMARTGLASSES },
+    { "VUZI",        CATEGORY_SMARTGLASSES },
+    { "SMART GLASS", CATEGORY_SMARTGLASSES },
+};
 
-/**
- * @brief Enable ESP-IDF promiscuous receive mode.
- */
-static void wifi_monitor_start( void );
+#define BLE_NAME_SIGNATURE_COUNT \
+    ( sizeof( ble_name_signatures ) / sizeof( ble_name_signatures[0] ) )
 
-/**
- * @brief Handle one received management or data frame.
- * @param a_buffer Received promiscuous packet buffer.
- * @param a_type Packet type reported by ESP-IDF.
- */
-static void wifi_promiscuous_rx( void *a_buffer,
-                                 wifi_promiscuous_pkt_type_t a_type );
-
-/**
- * @brief Identify client addresses from an observed 802.11 frame.
- * @param a_frame Raw 802.11 frame payload.
- * @param a_type ESP-IDF packet type.
- * @param a_channel Channel on which the frame was received.
- * @param a_rssi Received signal strength in dBm.
- */
-static void wifi_observe_client_frame( const uint8_t *a_frame,
-                                       wifi_promiscuous_pkt_type_t a_type,
-                                       uint8_t a_channel,
-                                       int8_t a_rssi );
-
-/**
- * @brief Log a client MAC the first time it is observed.
- * @param a_mac Six-byte client MAC address.
- * @param a_channel Channel on which the client was observed.
- * @param a_rssi Received signal strength in dBm.
- */
-static void wifi_observe_client( const uint8_t *a_mac,
-                                 uint8_t a_channel,
-                                 int8_t a_rssi );
-
-/**
- * @brief Match an observed MAC address against the OUI database.
- * @param a_mac Six-byte MAC address.
- */
-static void oui_observe_mac( const uint8_t *a_mac );
-
-/**
- * @brief Remember a matching MAC if it has not already been counted.
- * @param a_mac Six-byte MAC address.
- * @param a_category Category associated with the address.
- * @return True when the MAC was newly stored; false otherwise.
- */
-static bool oui_remember_mac( const uint8_t *a_mac,
-                              oui_category_t a_category );
-
-/**
- * @brief Select the LCD color for a category count.
- * @param a_count Number of unique matching devices.
- * @return White for zero, yellow for 1-5, and magenta for 6 or more.
- */
+static void wifi_observation( wifi_observation_type_t a_type,
+                              const uint8_t *a_mac,
+                              uint8_t a_channel,
+                              int8_t a_rssi );
+static void ble_observation( const ble_observation_t *a_observation );
+static bool detector_match_oui( const uint8_t *a_mac,
+                                detector_category_t *a_category );
+static bool detector_match_ble( const ble_observation_t *a_observation,
+                                detector_category_t *a_category );
+static bool detector_remember( detector_source_t a_source,
+                               const uint8_t *a_address,
+                               uint8_t a_address_type,
+                               detector_category_t a_category );
+static bool string_contains_case_insensitive( const char *a_value,
+                                              const char *a_fragment );
 static uint16_t category_color( uint16_t a_count );
-
-/**
- * @brief Draw detector counts and prevalence bars into the LCD framebuffer.
- * @return ESP_OK on success; an ESP-IDF error code on failure.
- */
 static esp_err_t lcd_draw_status( void );
-
-/**
- * @brief Refresh the LCD if its periodic update interval has elapsed.
- */
 static void lcd_refresh_if_due( void );
-
-/**
- * @brief Hop through every channel in one WiFi sweep.
- * @param a_sweep Sweep state and channel plan.
- */
-static void wifi_monitor_sweep( wifi_sweep_t *a_sweep );
 
 /**
  * @brief Application entry point.
@@ -330,273 +259,287 @@ void app_main( void )
 
     lcd_last_refresh = xTaskGetTickCount();
 
-    wifi_init();
-    wifi_monitor_start();
-
-    wifi_sweep_t sweep_2g =
-    {
-        .band = WIFI_BAND_MODE_2G_ONLY,
-        .channels = wifi_2g_channels,
-        .channel_count = WIFI_2G_CHANNEL_COUNT,
-        .dwell_ms = WIFI_2G_CHANNEL_DWELL_MS,
-        .start_offset = 0,
-    };
-
-    wifi_sweep_t sweep_5g =
-    {
-        .band = WIFI_BAND_MODE_5G_ONLY,
-        .channels = wifi_5g_channels,
-        .channel_count = WIFI_5G_CHANNEL_COUNT,
-        .dwell_ms = WIFI_5G_CHANNEL_DWELL_MS,
-        .start_offset = 0,
-    };
+    ESP_ERROR_CHECK( wifi_monitor_init( wifi_observation ) );
+    ESP_ERROR_CHECK( ble_monitor_init( ble_observation ) );
 
     while( 1 )
     {
-        wifi_monitor_sweep( &sweep_2g );
-        wifi_monitor_sweep( &sweep_5g );
+        wifi_monitor_step();
+        lcd_refresh_if_due();
     }
 }
 
 /**
- * @brief Initialize WiFi without a station/AP interface.
- * @details Promiscuous mode is supported in WIFI_MODE_NULL. Avoiding a station
- *          interface keeps this application receive-only and eliminates
- *          association/power-save behavior that is unnecessary for sniffing.
- */
-static void wifi_init( void )
-{
-    ESP_ERROR_CHECK( esp_netif_init() );
-    ESP_ERROR_CHECK( esp_event_loop_create_default() );
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK( esp_wifi_init( &cfg ) );
-    ESP_ERROR_CHECK( esp_wifi_set_mode( WIFI_MODE_NULL ) );
-    ESP_ERROR_CHECK( esp_wifi_start() );
-}
-
-/**
- * @brief Configure and enable passive promiscuous monitoring.
- */
-static void wifi_monitor_start( void )
-{
-    wifi_promiscuous_filter_t filter =
-    {
-        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT |
-                       WIFI_PROMIS_FILTER_MASK_DATA,
-    };
-
-    ESP_ERROR_CHECK( esp_wifi_set_promiscuous_filter( &filter ) );
-    ESP_ERROR_CHECK( esp_wifi_set_promiscuous_rx_cb( wifi_promiscuous_rx ) );
-    ESP_ERROR_CHECK( esp_wifi_set_promiscuous( true ) );
-
-    ESP_LOGI( TAG, "Passive monitor enabled" );
-}
-
-/**
- * @brief Handle one received 802.11 management or data frame.
- * @param a_buffer Received promiscuous packet buffer.
- * @param a_type Packet type reported by ESP-IDF.
- */
-static void wifi_promiscuous_rx( void *a_buffer,
-                                 wifi_promiscuous_pkt_type_t a_type )
-{
-    if( a_buffer == NULL ||
-        ( a_type != WIFI_PKT_MGMT && a_type != WIFI_PKT_DATA ) )
-    {
-        return;
-    }
-
-    const wifi_promiscuous_pkt_t *packet =
-        (const wifi_promiscuous_pkt_t *)a_buffer;
-
-    if( packet->rx_ctrl.sig_len < IEEE80211_ADDR2_MIN_LEN )
-    {
-        return;
-    }
-
-    const uint8_t *frame = packet->payload;
-
-    wifi_observe_client_frame( frame,
-                               a_type,
-                               packet->rx_ctrl.channel,
-                               packet->rx_ctrl.rssi );
-
-    oui_observe_mac( &frame[IEEE80211_ADDR1_OFFSET] );
-    oui_observe_mac( &frame[IEEE80211_ADDR2_OFFSET] );
-}
-
-/**
- * @brief Identify likely client addresses from an observed 802.11 frame.
- * @param a_frame Raw 802.11 frame payload.
- * @param a_type ESP-IDF packet type.
- * @param a_channel Channel on which the frame was received.
- * @param a_rssi Received signal strength in dBm.
- * @details Probe requests identify the transmitter as a client. Infrastructure
- *          data frames identify the station using the To DS / From DS bits.
- */
-static void wifi_observe_client_frame( const uint8_t *a_frame,
-                                       wifi_promiscuous_pkt_type_t a_type,
-                                       uint8_t a_channel,
-                                       int8_t a_rssi )
-{
-    const uint16_t frame_control =
-        (uint16_t)a_frame[0] | ( (uint16_t)a_frame[1] << 8 );
-
-    if( a_type == WIFI_PKT_MGMT )
-    {
-        const uint8_t subtype = ( frame_control >> 4 ) & 0x0FU;
-
-        if( subtype == 4 )
-        {
-            wifi_observe_client( &a_frame[IEEE80211_ADDR2_OFFSET],
-                                 a_channel,
-                                 a_rssi );
-        }
-
-        return;
-    }
-
-    const bool to_ds = ( frame_control & 0x0100U ) != 0;
-    const bool from_ds = ( frame_control & 0x0200U ) != 0;
-
-    if( to_ds && !from_ds )
-    {
-        wifi_observe_client( &a_frame[IEEE80211_ADDR2_OFFSET],
-                             a_channel,
-                             a_rssi );
-    }
-    else if( !to_ds && from_ds )
-    {
-        wifi_observe_client( &a_frame[IEEE80211_ADDR1_OFFSET],
-                             a_channel,
-                             a_rssi );
-    }
-}
-
-/**
- * @brief Log a client MAC the first time it is observed.
- * @param a_mac Six-byte client MAC address.
- * @param a_channel Channel on which the client was observed.
+ * @brief Consume a classified AP or client observation from wifi_monitor.
+ * @param a_type Inferred WiFi endpoint type.
+ * @param a_mac Six-byte MAC address.
+ * @param a_channel Receive channel.
  * @param a_rssi Received signal strength in dBm.
  */
-static void wifi_observe_client( const uint8_t *a_mac,
-                                 uint8_t a_channel,
-                                 int8_t a_rssi )
+static void wifi_observation( wifi_observation_type_t a_type,
+                              const uint8_t *a_mac,
+                              uint8_t a_channel,
+                              int8_t a_rssi )
 {
-    if( a_mac == NULL || ( a_mac[0] & 0x01U ) != 0 )
-    {
-        return;
-    }
+    size_t free_slot = MAX_WIFI_ENDPOINTS;
 
-    size_t free_slot = MAX_OBSERVED_CLIENTS;
-
-    for( size_t i = 0; i < MAX_OBSERVED_CLIENTS; i++ )
+    for( size_t i = 0; i < MAX_WIFI_ENDPOINTS; i++ )
     {
-        if( observed_clients[i].used )
+        if( wifi_endpoints[i].used )
         {
-            if( memcmp( observed_clients[i].mac,
-                        a_mac,
-                        sizeof( observed_clients[i].mac ) ) == 0 )
+            if( wifi_endpoints[i].type == a_type &&
+                memcmp( wifi_endpoints[i].mac, a_mac, 6 ) == 0 )
             {
                 return;
             }
         }
-        else if( free_slot == MAX_OBSERVED_CLIENTS )
+        else if( free_slot == MAX_WIFI_ENDPOINTS )
         {
             free_slot = i;
         }
     }
 
-    if( free_slot == MAX_OBSERVED_CLIENTS )
+    if( free_slot < MAX_WIFI_ENDPOINTS )
+    {
+        memcpy( wifi_endpoints[free_slot].mac, a_mac, 6 );
+        wifi_endpoints[free_slot].type = a_type;
+        wifi_endpoints[free_slot].used = true;
+
+        ESP_LOGI( TAG,
+                  "%s observed: %02X:%02X:%02X:%02X:%02X:%02X ch=%u rssi=%d",
+                  a_type == WIFI_OBSERVATION_AP ? "AP" : "Client",
+                  a_mac[0], a_mac[1], a_mac[2],
+                  a_mac[3], a_mac[4], a_mac[5],
+                  a_channel, a_rssi );
+    }
+
+    detector_category_t category;
+
+    if( detector_match_oui( a_mac, &category ) &&
+        detector_remember( DETECTOR_SOURCE_WIFI, a_mac, 0, category ) )
+    {
+        categories[category].count++;
+        ESP_LOGI( TAG,
+                  "New %s WiFi device (%u total)",
+                  categories[category].name,
+                  categories[category].count );
+    }
+}
+
+/**
+ * @brief Consume and classify one parsed BLE advertisement.
+ * @param a_observation Parsed BLE advertiser and fingerprint fields.
+ */
+static void ble_observation( const ble_observation_t *a_observation )
+{
+    if( a_observation == NULL )
     {
         return;
     }
 
-    memcpy( observed_clients[free_slot].mac,
-            a_mac,
-            sizeof( observed_clients[free_slot].mac ) );
-    observed_clients[free_slot].used = true;
+    size_t free_slot = MAX_BLE_ENDPOINTS;
+    bool known = false;
 
-    ESP_LOGI( TAG,
-              "Client observed: %02X:%02X:%02X:%02X:%02X:%02X ch=%u rssi=%d",
-              a_mac[0], a_mac[1], a_mac[2],
-              a_mac[3], a_mac[4], a_mac[5],
-              a_channel, a_rssi );
+    for( size_t i = 0; i < MAX_BLE_ENDPOINTS; i++ )
+    {
+        if( ble_endpoints[i].used )
+        {
+            if( ble_endpoints[i].address_type == a_observation->address_type &&
+                memcmp( ble_endpoints[i].address,
+                        a_observation->address,
+                        sizeof( ble_endpoints[i].address ) ) == 0 )
+            {
+                known = true;
+                break;
+            }
+        }
+        else if( free_slot == MAX_BLE_ENDPOINTS )
+        {
+            free_slot = i;
+        }
+    }
+
+    if( !known && free_slot < MAX_BLE_ENDPOINTS )
+    {
+        memcpy( ble_endpoints[free_slot].address,
+                a_observation->address,
+                sizeof( ble_endpoints[free_slot].address ) );
+        ble_endpoints[free_slot].address_type = a_observation->address_type;
+        ble_endpoints[free_slot].used = true;
+
+        ESP_LOGI( TAG,
+                  "BLE observed: %02X:%02X:%02X:%02X:%02X:%02X type=%u rssi=%d%s%s",
+                  a_observation->address[0], a_observation->address[1],
+                  a_observation->address[2], a_observation->address[3],
+                  a_observation->address[4], a_observation->address[5],
+                  a_observation->address_type,
+                  a_observation->rssi,
+                  a_observation->has_name ? " name=" : "",
+                  a_observation->has_name ? a_observation->name : "" );
+    }
+
+    detector_category_t category;
+
+    if( detector_match_ble( a_observation, &category ) &&
+        detector_remember( DETECTOR_SOURCE_BLE,
+                           a_observation->address,
+                           a_observation->address_type,
+                           category ) )
+    {
+        categories[category].count++;
+        ESP_LOGI( TAG,
+                  "New %s BLE device (%u total)",
+                  categories[category].name,
+                  categories[category].count );
+    }
 }
 
 /**
- * @brief Match an observed MAC and count it once per unique address.
+ * @brief Match a WiFi/public MAC address against the OUI database.
  * @param a_mac Six-byte MAC address.
+ * @param a_category Receives the matched category.
+ * @return True when an OUI match is found; false otherwise.
  */
-static void oui_observe_mac( const uint8_t *a_mac )
+static bool detector_match_oui( const uint8_t *a_mac,
+                                detector_category_t *a_category )
 {
-    if( a_mac == NULL || ( a_mac[0] & 0x01U ) != 0 )
+    if( a_mac == NULL || a_category == NULL || ( a_mac[0] & 0x01U ) != 0 )
     {
-        return;
+        return false;
     }
 
     for( size_t i = 0; i < OUI_DATABASE_COUNT; i++ )
     {
         if( memcmp( a_mac, oui_database[i].prefix, 3 ) == 0 )
         {
-            const oui_category_t category = oui_database[i].category;
-
-            if( oui_remember_mac( a_mac, category ) )
-            {
-                categories[category].count++;
-                ESP_LOGI( TAG,
-                          "New %s device (%u total)",
-                          categories[category].name,
-                          categories[category].count );
-            }
-
-            return;
+            *a_category = oui_database[i].category;
+            return true;
         }
     }
+
+    return false;
 }
 
 /**
- * @brief Remember a matching MAC if it has not already been counted.
- * @param a_mac Six-byte MAC address.
- * @param a_category Category associated with the address.
- * @return True when the MAC was newly stored; false otherwise.
+ * @brief Match a BLE advertisement using stable signature data first.
+ * @param a_observation Parsed BLE advertiser and fingerprint fields.
+ * @param a_category Receives the matched category.
+ * @return True when a signature or safe public-address OUI matches.
+ * @details Device-name signatures are intentionally product-specific. A
+ *          public BLE address may fall back to the existing OUI database.
+ *          Random/private addresses never use OUI matching.
  */
-static bool oui_remember_mac( const uint8_t *a_mac,
-                              oui_category_t a_category )
+static bool detector_match_ble( const ble_observation_t *a_observation,
+                                detector_category_t *a_category )
 {
-    size_t free_slot = MAX_OBSERVED_MACS;
-
-    for( size_t i = 0; i < MAX_OBSERVED_MACS; i++ )
+    if( a_observation == NULL || a_category == NULL )
     {
-        if( observed_macs[i].used )
+        return false;
+    }
+
+    if( a_observation->has_name )
+    {
+        for( size_t i = 0; i < BLE_NAME_SIGNATURE_COUNT; i++ )
         {
-            if( memcmp( observed_macs[i].mac,
-                        a_mac,
-                        sizeof( observed_macs[i].mac ) ) == 0 )
+            if( string_contains_case_insensitive(
+                    a_observation->name,
+                    ble_name_signatures[i].name_fragment ) )
+            {
+                *a_category = ble_name_signatures[i].category;
+                return true;
+            }
+        }
+    }
+
+    /* BLE public address type is zero in the NimBLE host API. */
+    if( a_observation->address_type == 0 )
+    {
+        return detector_match_oui( a_observation->address, a_category );
+    }
+
+    return false;
+}
+
+/**
+ * @brief Remember a categorized radio device once.
+ * @param a_source Radio source used to observe the device.
+ * @param a_address Six-byte WiFi/BLE address.
+ * @param a_address_type BLE address type; zero for WiFi.
+ * @param a_category Matched detector category.
+ * @return True when the device was newly stored; false if already counted.
+ */
+static bool detector_remember( detector_source_t a_source,
+                               const uint8_t *a_address,
+                               uint8_t a_address_type,
+                               detector_category_t a_category )
+{
+    size_t free_slot = MAX_OBSERVED_DEVICES;
+
+    for( size_t i = 0; i < MAX_OBSERVED_DEVICES; i++ )
+    {
+        if( observed_devices[i].used )
+        {
+            if( observed_devices[i].source == a_source &&
+                observed_devices[i].address_type == a_address_type &&
+                memcmp( observed_devices[i].address, a_address, 6 ) == 0 )
             {
                 return false;
             }
         }
-        else if( free_slot == MAX_OBSERVED_MACS )
+        else if( free_slot == MAX_OBSERVED_DEVICES )
         {
             free_slot = i;
         }
     }
 
-    if( free_slot == MAX_OBSERVED_MACS )
+    if( free_slot == MAX_OBSERVED_DEVICES )
     {
         return false;
     }
 
-    memcpy( observed_macs[free_slot].mac,
-            a_mac,
-            sizeof( observed_macs[free_slot].mac ) );
-
-    observed_macs[free_slot].category = a_category;
-    observed_macs[free_slot].used = true;
+    observed_devices[free_slot].source = a_source;
+    memcpy( observed_devices[free_slot].address, a_address, 6 );
+    observed_devices[free_slot].address_type = a_address_type;
+    observed_devices[free_slot].category = a_category;
+    observed_devices[free_slot].used = true;
 
     return true;
+}
+
+/**
+ * @brief Test whether one ASCII string contains another ignoring case.
+ * @param a_value String to search.
+ * @param a_fragment String fragment to locate.
+ * @return True when a_fragment occurs within a_value; false otherwise.
+ */
+static bool string_contains_case_insensitive( const char *a_value,
+                                              const char *a_fragment )
+{
+    if( a_value == NULL || a_fragment == NULL || a_fragment[0] == '\0' )
+    {
+        return false;
+    }
+
+    const size_t fragment_length = strlen( a_fragment );
+
+    for( const char *value = a_value; *value != '\0'; value++ )
+    {
+        size_t i = 0;
+
+        while( i < fragment_length && value[i] != '\0' &&
+               toupper( (unsigned char)value[i] ) ==
+               toupper( (unsigned char)a_fragment[i] ) )
+        {
+            i++;
+        }
+
+        if( i == fragment_length )
+        {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 /**
@@ -611,12 +554,7 @@ static uint16_t category_color( uint16_t a_count )
         return LCD_WHITE;
     }
 
-    if( a_count < CATEGORY_HIGH_COUNT )
-    {
-        return LCD_YELLOW;
-    }
-
-    return LCD_MAGENTA;
+    return a_count < CATEGORY_HIGH_COUNT ? LCD_YELLOW : LCD_MAGENTA;
 }
 
 /**
@@ -644,7 +582,6 @@ static esp_err_t lcd_draw_status( void )
     snprintf( text, sizeof( text ), "OUI-SPY C5 N:%u", total_count );
     lcd_set_cursor( 4, 0 );
     ESP_ERROR_CHECK( lcd_draw_text( text, LCD_CYAN, LCD_BLACK ) );
-
     ESP_ERROR_CHECK( lcd_draw_line( 2,
                                     STATUS_DIVIDER_Y,
                                     LCD_WIDTH - 3,
@@ -664,7 +601,6 @@ static esp_err_t lcd_draw_status( void )
         snprintf( text, sizeof( text ), "%u", categories[i].count );
         lcd_set_cursor( STATUS_COUNT_X, y );
         ESP_ERROR_CHECK( lcd_draw_text( text, color, LCD_BLACK ) );
-
         ESP_ERROR_CHECK( lcd_draw_line( STATUS_BAR_X,
                                         y + 6,
                                         STATUS_BAR_X + STATUS_BAR_WIDTH,
@@ -692,16 +628,13 @@ static esp_err_t lcd_draw_status( void )
 }
 
 /**
- * @brief Refresh the LCD if its periodic update interval has elapsed.
- * @details Display traffic is intentionally decoupled from channel changes so
- *          the radio spends nearly all of each sweep interval listening.
+ * @brief Refresh the LCD when its periodic update interval has elapsed.
  */
 static void lcd_refresh_if_due( void )
 {
     const TickType_t now = xTaskGetTickCount();
-    const TickType_t refresh_ticks = pdMS_TO_TICKS( WIFI_LCD_REFRESH_MS );
 
-    if( ( now - lcd_last_refresh ) < refresh_ticks )
+    if( ( now - lcd_last_refresh ) < pdMS_TO_TICKS( LCD_REFRESH_MS ) )
     {
         return;
     }
@@ -709,48 +642,4 @@ static void lcd_refresh_if_due( void )
     ESP_ERROR_CHECK( lcd_draw_status() );
     ESP_ERROR_CHECK( lcd_flush() );
     lcd_last_refresh = now;
-}
-
-/**
- * @brief Hop through every channel in one WiFi sweep.
- * @param a_sweep Sweep state and channel plan.
- * @details The starting point rotates after each sweep. This avoids always
- *          visiting a particular channel at the same point in the cycle and
- *          reduces systematic misses from periodic/bursty transmitters.
- */
-static void wifi_monitor_sweep( wifi_sweep_t *a_sweep )
-{
-    esp_err_t err = esp_wifi_set_band_mode( a_sweep->band );
-
-    if( err != ESP_OK )
-    {
-        ESP_LOGW( TAG,
-                  "Unable to select band: %s",
-                  esp_err_to_name( err ) );
-        return;
-    }
-
-    for( size_t i = 0; i < a_sweep->channel_count; i++ )
-    {
-        const size_t index =
-            ( a_sweep->start_offset + i ) % a_sweep->channel_count;
-        const uint8_t channel = a_sweep->channels[index];
-
-        err = esp_wifi_set_channel( channel, WIFI_SECOND_CHAN_NONE );
-
-        if( err != ESP_OK )
-        {
-            ESP_LOGD( TAG,
-                      "Skipping channel %u: %s",
-                      channel,
-                      esp_err_to_name( err ) );
-            continue;
-        }
-
-        vTaskDelay( pdMS_TO_TICKS( a_sweep->dwell_ms ) );
-        lcd_refresh_if_due();
-    }
-
-    a_sweep->start_offset =
-        ( a_sweep->start_offset + 1 ) % a_sweep->channel_count;
 }
