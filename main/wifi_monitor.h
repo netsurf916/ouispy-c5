@@ -14,6 +14,9 @@
 
 /**
  * @brief WiFi endpoint type inferred from an observed 802.11 frame.
+ * @details Access points are identified from beacon/probe-response frames and
+ *          infrastructure data direction. Clients are identified from probe
+ *          requests and the station side of infrastructure data frames.
  */
 typedef enum
 {
@@ -24,8 +27,9 @@ typedef enum
 /**
  * @brief Callback invoked for classified WiFi AP/client MAC observations.
  * @param a_type Inferred endpoint type.
- * @param a_mac Six-byte MAC address.
- * @param a_channel Receive channel.
+ * @param a_mac Six-byte MAC address. The pointer is valid only for the duration
+ *              of the callback and must be copied if retained.
+ * @param a_channel Receive channel reported by the ESP-IDF promiscuous packet.
  * @param a_rssi Received signal strength in dBm.
  */
 typedef void ( *wifi_observation_cb_t )( wifi_observation_type_t a_type,
@@ -37,11 +41,16 @@ typedef void ( *wifi_observation_cb_t )( wifi_observation_type_t a_type,
  * @brief Initialize receive-only WiFi promiscuous monitoring.
  * @param a_callback Optional callback for classified AP/client observations.
  * @return ESP_OK on success; an ESP-IDF error code on failure.
+ * @details WiFi is started in WIFI_MODE_NULL, promiscuous reception is enabled
+ *          for management and data frames, and no network association is made.
  */
 esp_err_t wifi_monitor_init( wifi_observation_cb_t a_callback );
 
 /**
  * @brief Advance the passive monitor by one channel dwell.
- * @details Repeated calls rotate across the configured 2.4 and 5 GHz plans.
+ * @details Repeated calls rotate across the configured 2.4 GHz and 5 GHz
+ *          channel plans. Unsupported channels are skipped when rejected by
+ *          ESP-IDF. The call blocks for the configured dwell time on a valid
+ *          channel so promiscuous callbacks can collect traffic.
  */
 void wifi_monitor_step( void );
